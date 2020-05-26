@@ -1,0 +1,195 @@
+#!/bin/sh
+# \
+exec tclsh $0 $*
+
+package require Tcl 8.6
+
+load ./libsrcs.so
+
+source srcs.tcl
+source tcl2json.tcl
+
+proc terminate {{code 0}} {
+	global output log
+	
+	puts [set output [tcl2json [dict create {*}$output]]]
+
+	puts $log "-- JSON output "
+	puts $log $output
+	
+	exit $code
+}
+
+proc purify {err} {
+	string map {' "_" $ "_" ; "_"} $err
+}
+
+
+# open log file
+lassign $argv cmd
+set output [list]
+if { [catch {set log [open ./log w]} err] } {
+	lappend output "status" [purify $err] 
+	terminate
+}
+puts $log "-- log open"
+
+# number of scenarios to consider during simulations
+set simmax [expr 100]
+
+# load problem: evaluate statements
+puts $log "-- reading input"
+while { [gets stdin line] >= 0 } {
+	eval [string trim $line]
+	puts $log "eval $line"
+}
+
+# load problem: confirm necessary vars were set
+foreach var {n pre} {
+	if { ![info exists $var] } {
+		lappend output "status" "$var undefined"
+		terminate
+	}
+}
+
+lappend output "n" $n
+
+# initialize plan
+srcs::c_plan_new .plan $n
+srcs::c_matr_new .plan.o 1 $n
+
+for {set j 0} {$j < $n} {incr j} {
+	foreach i [lindex $pre $j] {
+		 if { [catch {srcs::c_plan_set_edge .plan $i $j 1} err] } {
+			lappend output "status" [purify $err]
+			terminate
+		}
+	}
+}
+
+# confirm acyclicity
+if { [srcs::c_plan_order .plan.o .plan] < 0 } {
+	lappend output "status" "cyclic plan"
+	terminate
+}
+
+# process commad
+puts $log "-- processing $cmd"
+
+if { $cmd == "augment" } {
+
+	# output topological sort
+	set order [list]
+	for {set xi 0} {$xi < $n} {incr xi} {
+		set i [srcs::c_matr_get .plan.o 0 $xi int]
+		lappend order $i
+	}
+	lappend output "order" $order
+
+	# output transitive closure
+	srcs::c_plan_new .plan.tc $n
+	srcs::c_plan_tc .plan.tc .plan .plan.o
+
+	set tpre [dict create]
+	for {set xj 0} {$xj < $n} {incr xj} {
+		set j [srcs::c_matr_get .plan.o 0 $xj int]
+		set pre [list]
+		for {set xi 0} {$xi < $xj} {incr xi} {
+			set i [srcs::c_matr_get .plan.o 0 $xi int]
+			if [srcs::c_plan_get_edge .plan.tc $i $j] {
+				lappend pre $i
+			}
+		}
+		dict set tpre $j $pre
+	}
+	lappend output "tpre" $tpre
+
+	# duration sample & percentiles
+	srcs::c_matr_new .d $simmax $n
+	lappend output "beta" [srcs::beta .d $simmax $dmin $dmax]
+
+	
+	# planned start-times and week-days
+	srcs::c_matr_new .s 1 $n
+	srcs::c_matr_new .sday 1 $n
+	srcs::matr_set_row .s 0 $s real
+	srcs::matr_set_row .sday 0 $sday real
+
+	# simulated start-times
+	srcs::c_matr_new .plan.est $simmax $n
+	srcs::c_mcarlo_est_nwd .plan.est .plan .plan.o .d .s .sday $simmax
+
+	set duse [dict create]
+	for {set i 0} {$i < $n} {incr i} {
+		#dict set duse $i [expr round([srcs::c_matr_p_j .d $simmax $i 0.75])]
+		dict set duse $i [expr round([srcs::c_matr_m1 .d $simmax $i real])]
+	}
+	lappend output "duse" $duse
+
+	# simulated finish-times
+	srcs::c_matr_new .plan.eft $simmax $n
+	srcs::c_matr_copy .plan.eft .plan.est
+	srcs::c_matr_add .plan.eft .d real
+
+	# output est, eft, start-time robustness
+	set est [dict create]
+	set eft [dict create]
+	set srb [dict create]
+	for {set i 0} {$i < $n} {incr i} {
+		set si [lindex $s $i]
+		dict set est $i [dict create]
+		dict set srb $i 0
+		for {set sim 0} {$sim < $simmax} {incr sim} {
+			set esti [srcs::c_matr_get .plan.est $sim $i real]
+			if {$esti <= $si} {
+				dict incr srb $i
+			}
+		}
+		dict set srb $i [expr 1.0*[dict get $srb $i] / $simmax]
+
+		foreach p {0.25 0.5 0.8 0.95 1.0} {
+			set t [expr round([srcs::c_matr_p_j .plan.est $simmax $i $p])]
+			dict set est $i $t $p
+
+			set t [expr round([srcs::c_matr_p_j .plan.eft $simmax $i $p])]
+			dict set eft $i $t $p
+		}
+	}
+	lappend output "est" $est
+	lappend output "eft" $eft
+	lappend output "srb" $srb
+
+
+	# simulated criticalities
+	srcs::c_matr_new .plan.crt $simmax $n
+	set crt [dict create]
+	foreach j $dlines {
+		set jcrt [dict create]
+		srcs::c_mcarlo_crt .plan.crt .NULL .plan.est .s .d $simmax .plan .plan.o $j
+		foreach i [dict get $tpre $j] {
+			dict set jcrt $i [srcs::c_matr_m1 .plan.crt $simmax $i real]
+		}
+		dict set crt $j $jcrt
+	}
+	lappend output "crt" $crt
+
+	srcs::c_matr_new .plan.crt0 $simmax $n
+	srcs::c_matr_new .zero 1 $n
+
+	set crt0 [dict create]
+	foreach j $dlines {
+		set jcrt [dict create]
+		srcs::c_mcarlo_crt .plan.crt0 .NULL .plan.est .zero .d $simmax .plan .plan.o $j
+		foreach i [dict get $tpre $j] {
+			dict set jcrt $i [srcs::c_matr_m1 .plan.crt0 $simmax $i real]
+		}
+		dict set crt0 $j $jcrt
+	}
+	lappend output "crt0" $crt0
+	
+
+	# terminate successfuly
+	lappend output "status" "ok"
+	terminate
+}
+
